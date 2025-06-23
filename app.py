@@ -1,6 +1,7 @@
 import os
 import uuid
 import chardet
+import logging
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -17,10 +18,18 @@ from langchain.prompts import PromptTemplate
 import asyncio
 from langchain.prompts import PromptTemplate
 
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    filename='bot.log',  
+    filemode='a'
+)
+logger = logging.getLogger(__name__)
+
 # Путь к локальной базе
 CHROMA_PATH = "chroma_db"
 
-# Инициализация эмбеддингов и хранилища
+# Инициализация эмбеддингов, хранилища и llm
 embedding_model = HuggingFaceEmbeddings(
     model_name="intfloat/multilingual-e5-base",
     model_kwargs={"device": "cpu"},
@@ -67,8 +76,10 @@ qa_chain = RetrievalQA.from_chain_type(
 async def handle_file(update: Update, context: CallbackContext):
     user_id = str(update.message.from_user.id)
     doc = update.message.document
+    logger.info(f"User {user_id} uploaded file: {doc.file_name}")
 
     if not doc.file_name.endswith(".txt"):
+        logger.warning(f"User {user_id} uploaded unsupported file type.")
         await update.message.reply_text("Пока поддерживаются только .txt файлы.")
         return
 
@@ -78,6 +89,7 @@ async def handle_file(update: Update, context: CallbackContext):
     file = await doc.get_file()
     file_path = f"temp_{uuid.uuid4()}.txt"
     await file.download_to_drive(file_path)
+    logger.info(f"Downloaded file to {file_path}")
 
     # Определим кодировку
     with open(file_path, "rb") as f:
@@ -88,29 +100,32 @@ async def handle_file(update: Update, context: CallbackContext):
     try:
         text = raw_data.decode(encoding)
     except UnicodeDecodeError:
+        logger.error(f"Decoding error for user {user_id} with encoding {encoding}")
         await status_message.edit_text(f"❌ Не удалось декодировать файл (кодировка: {encoding}).")
         os.remove(file_path)
         return
 
     os.remove(file_path)
+    logger.info(f"File {file_path} removed after decoding.")
 
     # Чанкинг
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = splitter.create_documents([text], metadatas=[{"user_id": user_id}])
+    logger.info(f"Created {len(chunks)} chunks for user {user_id}")
 
     # Сохраняем в Chroma
     vectorstore.add_documents(chunks)
+    logger.info(f"Chunks added to vectorstore for user {user_id}")
 
     await status_message.edit_text(f"✅ Файл обработан и добавлен в базу ({len(chunks)} чанков).")
+
 # Обработка запроса
 async def handle_query(update: Update, context: CallbackContext):
     query = update.message.text
     user_id = str(update.message.from_user.id)
+    logger.info(f"User {user_id} submitted query: {query}")
 
     qa_chain.retriever.search_kwargs["filter"] = {"user_id": user_id}
-
-    print("Using filter:", qa_chain.retriever.search_kwargs.get("filter"))
-    print("QA chain input keys:", qa_chain.input_keys)
 
     result = await asyncio.to_thread(lambda: qa_chain.invoke({"query": query}))
 
@@ -122,24 +137,31 @@ async def handle_query(update: Update, context: CallbackContext):
     )
 
     if not citations.strip():
+        logger.warning(f"No relevant sources found for user {user_id}'s query.")
         await update.message.reply_text("Не могу найти ответ на этот вопрос.")
         return
 
-    final_response = f"🧠 Ответ:\n{answer}\n\n📚 Источники:\n{citations}"
+    final_response = f"Ответ:\n{answer}\n\n📚 Источники:\n{citations}"
+    logger.info(f"Sending answer to user {user_id}")
     await update.message.reply_text(final_response[:4096])
 
 # Функция удаления документов по user_id
 async def handle_delete(update: Update, context: CallbackContext):
     user_id = str(update.message.from_user.id)
+    logger.info(f"User {user_id} requested deletion of their documents.")
     # Удаляем документы с метадатой user_id из векторного хранилища
     try:
         vectorstore._collection.delete(where={"user_id": user_id})
+        logger.info(f"Documents deleted for user {user_id}")
         await update.message.reply_text("Ваши документы удалены из базы.")
     except Exception as e:
+        logger.error(f"Error deleting documents for user {user_id}: {e}")
         await update.message.reply_text(f"Ошибка при удалении: {e}")
 
 # Команда /help
 async def handle_help(update: Update, context: CallbackContext):
+    user_id = str(update.message.from_user.id)
+    logger.info(f"User {user_id} requested help.")
     help_text = """
 📌 <b>Инструкция по использованию:</b>
 
@@ -168,8 +190,9 @@ def main():
     app.add_handler(CommandHandler("delete", handle_delete))
     app.add_handler(CommandHandler("help", handle_help))
 
+    logger.info("RAG Telegram bot started...")
     print("RAG-бот запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
